@@ -1,0 +1,169 @@
+import os
+import logging
+import subprocess
+import serial
+import time
+import threading
+import re
+from queue import Queue
+from aixplain.factories import ModelFactory
+
+# Setup logging for better error tracking
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("root").setLevel(logging.WARNING)
+
+# Ensure API key is set properly
+api_key = "API_KEY"
+if not api_key:
+    raise Exception("Error: TEAM_API_KEY not found. Please set the API key in your environment variables.")
+
+# Initialize model (GPT-3.5 model or similar)
+try:
+    model = ModelFactory.get("6646261c6eb563165658bbb1")
+    logging.info("Model initialized successfully.")
+except Exception as e:
+    logging.error(f"Model initialization failed: {e}")
+    exit()
+
+# Initialize GSM modem
+ser = serial.Serial('COM2', 9600, timeout=5)
+time.sleep(2)
+
+# Message queue
+message_queue = Queue()
+
+# Send AT commands to GSM modem
+def send_at_command(command, delay=2):
+    """Send AT commands to GSM module."""
+    ser.write((command + '\r').encode())
+    time.sleep(delay)
+    response = ser.read(ser.inWaiting()).decode(errors='ignore')
+    return response
+
+# Function to handle chatbot AI response via subprocess (GPT-3.5 or other models)
+def chatbot(message):
+    """Get AI response from GPT-3.5 or other models."""
+    try:
+        result = subprocess.run(
+            ['ollama', 'run', 'gpt-3.5', f'{message} in english'],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+        )
+        response = result.stdout.strip()
+        if not response:
+            return "Error: Empty response from AI."
+        return response
+    except subprocess.TimeoutExpired:
+        return "Error: AI response timed out."
+    except Exception as e:
+        print(f"Error: {e}")
+        return "Error occurred while generating response."
+
+# Function to split the message into 160-character chunks
+def split_message(message, chunk_size=160):
+    """Split message into 160-character chunks while preserving sentences."""
+    sentences = re.split(r'(?<=[.!?])\s+', message)
+    chunks = []
+    current_chunk = ""
+
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) + 1 <= chunk_size:
+            current_chunk += sentence + " "
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence + " "
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+# Function to send SMS through GSM module
+def send_sms(number, message):
+    """Send SMS through GSM module."""
+    send_at_command(f'AT+CMGS="{number}"')
+    ser.write((message + "\x1A").encode())
+    time.sleep(15)
+
+# Initialize GSM modem settings
+send_at_command('AT+CNMI=1,2,0,0,0')
+send_at_command('AT+CMGF=1')
+
+# Function to handle the chatbot input/output for user queries
+def handle_chatbot_input(user_input):
+    """Generate response from AI chatbot."""
+    try:
+        result = model.run({
+            "text": f"{user_input} in english.",
+            "temperature": 0.7,
+            "max_tokens": 100,
+            "context": None,
+            "prompt": None,
+            "history": None,
+            "top_p": 1.0
+        })
+
+        if result.status == 'SUCCESS':
+            return result.data
+        else:
+            return "Error: Failed to retrieve response."
+    except Exception as e:
+        logging.error(f"Error during model execution: {e}")
+        return " An error occurred. Please try again later."
+
+# Listening for incoming messages via GSM
+def listen_for_messages():
+    """Listen for incoming SMS and add them to the queue."""
+    print("Listening for incoming messages...")
+    while True:
+        response = send_at_command('AT+CMGL="REC UNREAD"')
+
+        if "+CMT:" in response:
+            lines = response.split('\n')
+
+            for i, line in enumerate(lines):
+                if "+CMT:" in line:
+                    sender_info = line.split(',')[0].split('"')[1]
+                    message = lines[i + 1].strip()
+                    message_queue.put((sender_info, message))
+                    print(f"Queued message from {sender_info}: {message}")
+
+        time.sleep(5)  # Reduced sleep time for faster response
+
+def process_messages():
+    """Process messages from the queue and send responses."""
+    while True:
+        if not message_queue.empty():
+            sender_info, message = message_queue.get()
+            print(f"Processing message from {sender_info}: {message}")
+
+            # Send acknowledgment message
+            ack_message = "Your question has been received. Please wait for the answer."
+            print(f"Sending Acknowledgment: {ack_message}")
+            send_sms(sender_info, ack_message)
+
+            # Get AI response in English
+            answer = handle_chatbot_input(message)
+            print(f"AI Response: {answer}")
+
+            # Split the response into chunks
+            chunks = split_message(answer)
+
+            # Send each chunk immediately for faster delivery
+            for index, chunk in enumerate(chunks):
+                print(f"Sending Response {index + 1}/{len(chunks)}: {chunk}")
+                send_sms(sender_info, chunk)
+
+            # Send completion message
+            completion_message = "This is your answer."
+            print(f"Sending Completion Message: {completion_message}")
+            send_sms(sender_info, completion_message)
+
+        time.sleep(2)  # Reduced sleep time for faster processing
+
+# Start threads for listening and processing
+threading.Thread(target=listen_for_messages, daemon=True).start()
+threading.Thread(target=process_messages, daemon=True).start()
+
+print("Chatbot is running...")
